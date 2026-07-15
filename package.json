@@ -28,7 +28,8 @@
   ],
   "scripts": {
     "check": "tsc --noEmit",
-    "pack:dry": "npm pack --dry-run"
+    "pack:dry": "npm pack --dry-run",
+    "test": "bun test"
   },
   "publishConfig": {
     "access": "public"
@@ -44,6 +45,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "latest",
+    "@types/bun": "latest",
     "@types/node": "^26.1.1",
     "typebox": "latest",
     "typescript": "^5.9.3"

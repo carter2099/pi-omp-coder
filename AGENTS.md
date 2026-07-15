@@ -14,22 +14,23 @@ The package is published to npm and installed by Pi users via `pi install npm:@c
 extensions/
   omp-delegate.ts   # the entire extension — registers the delegate_omp tool
 package.json        # package metadata, peer deps, pi extension manifest
-tsconfig.json        # strict TS, noEmit, only type-checks extensions/
+tsconfig.json        # strict TS, noEmit; type-checks extensions/ + test/
 README.md            # user-facing docs (npm/GitHub)
 LICENSE              # MIT
 ```
 
 There is exactly one source file. All logic lives in `extensions/omp-delegate.ts`.
 
-## Build / check / pack
+## Build / check / test / pack
 
 ```bash
 npm install          # install dev + peer deps
-npm run check        # tsc --noEmit — the only "test"; must stay clean
+npm run check        # tsc --noEmit — type-check only; must stay clean
+npm test             # bun test — runtime test suite
 npm run pack:dry     # npm pack --dry-run — verify what gets published
 ```
 
-No runtime build step. Pi loads the `.ts` extension directly via its bundled TypeScript runtime. `tsc --noEmit` is a type-check only; it produces no output.
+No runtime build step. Pi loads the `.ts` extension directly via its bundled TypeScript runtime. `tsc --noEmit` is a type-check only; it produces no output. `npm test` runs the bun:test suite covering every `execute` branch.
 
 ## The extension contract
 

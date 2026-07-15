@@ -91,26 +91,53 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
       // shells and npm global installs), then fall back to calling bun
       // directly with the cli.js entrypoint (handles systemd contexts where
       // ~/.bun/bin isn't on PATH and the shebang can't resolve bun).
+      // There are two distinct PATH-failure modes under non-interactive
+      // hosts like pi-web's systemd session daemon (whose service PATH
+      // commonly omits ~/.bun/bin):
+      //   1. "omp" isn't on PATH at all  -> spawn throws ENOENT.
+      //   2. "omp" is on PATH but its `#!/usr/bin/env bun` shebang can't
+      //      resolve bun from this process's PATH -> exec runs the script,
+      //      /usr/bin/env reports "bun: not found", and it exits 127 with no
+      //      stdout. That's a non-throwing spawn the catch alone would miss.
+      // Both fall through to invoking bun directly with the cli.js entrypoint.
       const home = os.homedir();
       const bunBin = `${home}/.bun/bin/bun`;
       const ompCli = `${home}/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js`;
 
+      // Track the first attempt so its output survives a failed fallback — we
+      // never want to mask the real error behind a second, vaguer failure.
+      let firstAttempt: { code?: number; stdout: string; stderr: string } | undefined;
       let result;
       try {
         result = await pi.exec("omp", args, { signal, cwd, timeout: timeoutMs });
-      } catch {
-        // PATH failed — try bun directly with the cli.js entrypoint
+        // Re-route into the catch only for the specific shebang-interpreter
+        // case: omp spawned but produced no output and exited 127 (the POSIX
+        // "interpreter not found" code — e.g. `#!/usr/bin/env bun` with bun
+        // absent from this process's PATH). A genuine omp failure that
+        // emitted output keeps its real stdout/stderr and falls through to
+        // the normal non-zero-exit path below — we don't retry on that.
+        if (result.code === 127 && (result.stdout ?? "").trim() === "") {
+          firstAttempt = result;
+          throw new Error(`omp exited 127 with no output (shebang interpreter not found): ${result.stderr || result.stdout}`);
+        }
+      } catch (err) {
+        // PATH/shebang failed — invoke bun directly with the cli.js
+        // entrypoint. The absolute paths make this PATH-independent, so it
+        // works even where omp's shebang couldn't resolve bun.
         try {
           result = await pi.exec(bunBin, [ompCli, ...args], { signal, cwd, timeout: timeoutMs });
-        } catch (err) {
+        } catch (fallbackErr) {
           // Clean up temp file on failure
           if (promptPath) await unlink(promptPath).catch(() => {});
+          const firstDiag = firstAttempt
+            ? `\n\nFirst attempt (omp on PATH):\n  exit: ${firstAttempt.code}\n  stdout: ${firstAttempt.stdout}\n  stderr: ${firstAttempt.stderr}`
+            : `\n\nFirst attempt (omp on PATH): ${err}`;
           return {
             content: [{
               type: "text",
-              text: `ERROR: Failed to spawn OMP. Tried 'omp' (PATH) and '${bunBin} ${ompCli}'. Is the OMP CLI installed?\n\n${err}`,
+              text: `ERROR: Failed to spawn OMP. Tried 'omp' (PATH), then '${bunBin} ${ompCli}'. Is the OMP CLI installed?${firstDiag}\n\nFallback error: ${fallbackErr}`,
             }],
-            details: { error: String(err), status: "spawn_failed" },
+            details: { status: "spawn_failed", firstAttempt, fallbackError: String(fallbackErr) },
           };
         }
       } finally {
