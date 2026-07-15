@@ -1,5 +1,9 @@
 # @carter2099/pi-omp-coder
 
+[![npm version](https://img.shields.io/npm/v/@carter2099/pi-omp-coder)](https://www.npmjs.com/package/@carter2099/pi-omp-coder)
+[![npm downloads](https://img.shields.io/npm/dm/@carter2099/pi-omp-coder)](https://www.npmjs.com/package/@carter2099/pi-omp-coder)
+[![license](https://img.shields.io/npm/l/@carter2099/pi-omp-coder)](https://github.com/carter2099/pi-omp-coder/blob/main/LICENSE)
+
 Pi extension that lets the agent delegate heavy coding tasks to an OMP (Oh My Pi) subprocess with a richer tool set including LSP, AST grep/edit, browser, and more.
 
 ## Prerequisites
