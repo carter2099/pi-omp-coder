@@ -68,24 +68,29 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
         details: { status: "running", cwd },
       });
 
-      // Resolve omp path: pi.exec inherits a minimal PATH (no ~/.bun/bin),
-      // so we use the absolute path to the bun-managed install.
+      // Resolve omp binary: try PATH first (works in interactive shells),
+      // fall back to bun's install path (needed for systemd contexts where
+      // ~/.bun/bin isn't on PATH).
       const home = os.homedir();
-      const ompPath = `${home}/.bun/bin/omp`;
+      const bunOmpPath = `${home}/.bun/bin/omp`;
 
       let result;
       try {
-        result = await pi.exec(ompPath, args, { signal, cwd, timeout: timeoutMs });
-      } catch (err) {
-        return {
-          content: [
-            {
+        // Primary: PATH lookup (fast path for interactive sessions)
+        result = await pi.exec("omp", args, { signal, cwd, timeout: timeoutMs });
+      } catch {
+        // Fallback: absolute path to bun-managed install
+        try {
+          result = await pi.exec(bunOmpPath, args, { signal, cwd, timeout: timeoutMs });
+        } catch (err) {
+          return {
+            content: [{
               type: "text",
-              text: `ERROR: Failed to spawn OMP at ${ompPath}. Is bun installed?\n\n${err}`,
-            },
-          ],
-          details: { error: String(err), status: "spawn_failed" },
-        };
+              text: `ERROR: Failed to spawn OMP. Tried 'omp' (PATH) and '${bunOmpPath}'. Is the OMP CLI installed?\n\n${err}`,
+            }],
+            details: { error: String(err), status: "spawn_failed" },
+          };
+        }
       }
 
       // Handle timeout/kill
