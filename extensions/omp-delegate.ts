@@ -4,21 +4,190 @@ import os from "os";
 import { writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 
+// ── Types ──
 
+export interface SpawnResult {
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  killed: boolean;
+}
+
+export interface SpawnOptions {
+  cwd: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}
+
+// ── Streaming spawn ──
+
+/** Grace period after exit before finalizing when stdio pipes are held open
+ *  by a detached descendant (mirrors Pi's waitForChildProcess). */
+const EXIT_STDIO_GRACE_MS = 100;
+
+/**
+ * Spawn a child process, stream stdout/stderr chunks via `onUpdate`,
+ * and return the accumulated output when the process terminates.
+ *
+ * Handles timeout with SIGTERM→SIGKILL escalation and abort signal.
+ * Resolves on 'close' (fast path) or on 'exit' + idle grace (handles
+ * detached descendants that keep the stdio pipe open, per pi#5303).
+ * Rejects only on spawn errors (ENOENT etc.).
+ */
+async function spawnWithStreaming(
+  command: string,
+  args: string[],
+  opts: SpawnOptions,
+  onUpdate?: (update: Record<string, unknown>) => void,
+): Promise<SpawnResult> {
+  const { cwd, timeoutMs, signal } = opts;
+  const { promise, resolve, reject } = Promise.withResolvers<SpawnResult>();
+
+  const child = spawn(command, args, {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: process.env,
+  });
+
+  let stdout = "";
+  let stderr = "";
+  const startTime = Date.now();
+
+  // Build a display string from accumulated output and elapsed time.
+  const buildDisplay = () => {
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const min = Math.floor(elapsed / 60);
+    const sec = elapsed % 60;
+    const elapsedStr = min > 0 ? `${min}m ${sec}s` : `${sec}s`;
+
+    let display = `[OMP running — ${elapsedStr} elapsed]`;
+    if (stderr) {
+      display += `\n\n${stderr}`;
+    }
+    if (stdout) {
+      display += `\n\n${stdout}`;
+    }
+    return display;
+  };
+
+  const sendUpdate = () => {
+    onUpdate?.({
+      content: [{ type: "text", text: buildDisplay() }],
+      details: { status: "streaming" },
+    });
+  };
+
+  // Heartbeat: send elapsed-time updates every 5s even when OMP is silent.
+  const heartbeatMs = 5000;
+  const heartbeatId = setInterval(sendUpdate, heartbeatMs);
+
+  // Re-arm idle timer when data arrives after exit (avoids truncating tail
+  // output of a detached descendant that's still writing).
+  let exitCode: number | null = null;
+  let postExitTimer: ReturnType<typeof setTimeout> | undefined;
+  const armIdleTimer = () => {
+    clearTimeout(postExitTimer);
+    postExitTimer = setTimeout(finalize, EXIT_STDIO_GRACE_MS);
+  };
+
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString();
+    sendUpdate();
+    if (exitCode !== null && !settled) armIdleTimer();
+  });
+
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+    sendUpdate();
+    if (exitCode !== null && !settled) armIdleTimer();
+  });
+  // Kill escalation: SIGTERM first, then SIGKILL after 5s if the process
+  // still hasn't died.
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let sigkillId: ReturnType<typeof setTimeout> | undefined;
+  const killProcess = () => {
+    if (child.killed) return;
+    child.kill("SIGTERM");
+    sigkillId = setTimeout(() => {
+      if (!child.killed) child.kill("SIGKILL");
+    }, 5000);
+  };
+
+  // Abort signal — check pre-aborted state before registering listener.
+  const onAbort = () => {
+    clearTimeout(timeoutId);
+    killProcess();
+  };
+  if (signal?.aborted) {
+    killProcess();
+  } else {
+    signal?.addEventListener("abort", onAbort, { once: true });
+  }
+
+  if (timeoutMs > 0) {
+    timeoutId = setTimeout(killProcess, timeoutMs);
+  }
+
+  const cleanup = () => {
+    clearTimeout(timeoutId);
+    clearTimeout(sigkillId);
+    clearTimeout(postExitTimer);
+    clearInterval(heartbeatId);
+    signal?.removeEventListener("abort", onAbort);
+  };
+
+  let settled = false;
+  function finalize() {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    (child.stdout as any)?.destroy?.();
+    (child.stderr as any)?.destroy?.();
+    resolve({
+      stdout,
+      stderr,
+      code: exitCode,
+      killed: child.killed || (signal?.aborted ?? false),
+    });
+  }
+
+  child.on("error", (err) => {
+    cleanup();
+    reject(err);
+  });
+
+  // Two termination paths:
+  //   1. 'close' — fast path when pipes close normally.
+  //   2. 'exit' + idle grace — handles detached descendants that inherited
+  //      the stdio pipe and never let 'close' fire (pi#5303).
+  child.on("exit", (code) => {
+    exitCode = code;
+    armIdleTimer();
+  });
+
+  child.on("close", (code) => {
+    exitCode = code;
+    finalize();
+  });
+
+  return promise;
+}
+// ── Extension ──
 
 export default function ompCoderExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "delegate_omp",
     label: "Delegate to OMP",
     description:
-      "Delegate a complex coding task to an OMP (Oh My Pi) agent with a richer tool set including LSP, AST grep/edit, browser, and more. The OMP agent runs a full agent loop and returns results. Use this for multi-file refactors, cross-file renames, or tasks requiring deep code intelligence.",
+      "Delegate a complex coding task to an OMP (Oh My Pi) agent with a richer tool set including LSP, AST grep/edit, browser, and more. The OMP agent runs a full agent loop and returns results. Progress is streamed in real-time. Use this for multi-file refactors, cross-file renames, or tasks requiring deep code intelligence.",
     promptSnippet:
       "delegate_omp: delegate heavy coding work to an OMP agent with richer tools (LSP, AST, browser)",
     promptGuidelines: [
       "Prefer delegate_omp for multi-file refactors, cross-file renames, or tasks requiring LSP/AST tools.",
       "Write a self-contained prompt — the OMP agent has no context from this session.",
-      "The call blocks until OMP finishes (up to the timeout). Do not use for quick one-liners.",
+      "The call blocks until OMP finishes (up to the timeout), but output streams in real-time.",
     ],
     parameters: Type.Object({
       prompt: Type.String({
@@ -87,6 +256,7 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
         details: { status: "running", cwd },
       });
 
+      const spawnOpts: SpawnOptions = { cwd, timeoutMs, signal };
       // Resolve omp: try PATH first (standard case — works for interactive
       // shells and npm global installs), then fall back to calling bun
       // directly with the cli.js entrypoint (handles systemd contexts where
@@ -94,11 +264,11 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
       // There are two distinct PATH-failure modes under non-interactive
       // hosts like pi-web's systemd session daemon (whose service PATH
       // commonly omits ~/.bun/bin):
-      //   1. "omp" isn't on PATH at all  -> spawn throws ENOENT.
+      //   1. "omp" isn't on PATH at all  -> spawn emits 'error' (ENOENT).
       //   2. "omp" is on PATH but its `#!/usr/bin/env bun` shebang can't
-      //      resolve bun from this process's PATH -> exec runs the script,
-      //      /usr/bin/env reports "bun: not found", and it exits 127 with no
-      //      stdout. That's a non-throwing spawn the catch alone would miss.
+      //      resolve bun from this process's PATH -> the script starts,
+      //      /usr/bin/env reports "bun: not found", and it exits 127 with
+      //      no stdout. That's a non-throwing close event we probe for.
       // Both fall through to invoking bun directly with the cli.js entrypoint.
       const home = os.homedir();
       const bunBin = `${home}/.bun/bin/bun`;
@@ -106,26 +276,26 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
 
       // Track the first attempt so its output survives a failed fallback — we
       // never want to mask the real error behind a second, vaguer failure.
-      let firstAttempt: { code?: number; stdout: string; stderr: string } | undefined;
-      let result;
+      let firstAttempt: SpawnResult | undefined;
+      let result: SpawnResult;
       try {
-        result = await pi.exec("omp", args, { signal, cwd, timeout: timeoutMs });
+        result = await spawnWithStreaming("omp", args, spawnOpts, onUpdate as ((u: Record<string, unknown>) => void) | undefined);
         // Re-route into the catch only for the specific shebang-interpreter
         // case: omp spawned but produced no output and exited 127 (the POSIX
         // "interpreter not found" code — e.g. `#!/usr/bin/env bun` with bun
         // absent from this process's PATH). A genuine omp failure that
         // emitted output keeps its real stdout/stderr and falls through to
         // the normal non-zero-exit path below — we don't retry on that.
-        if (result.code === 127 && (result.stdout ?? "").trim() === "") {
+        if (result.code === 127 && result.stdout.trim() === "") {
           firstAttempt = result;
-          throw new Error(`omp exited 127 with no output (shebang interpreter not found): ${result.stderr || result.stdout}`);
+          throw new Error(`omp exited 127 with no output (shebang interpreter not found): ${result.stderr}`);
         }
       } catch (err) {
         // PATH/shebang failed — invoke bun directly with the cli.js
         // entrypoint. The absolute paths make this PATH-independent, so it
         // works even where omp's shebang couldn't resolve bun.
         try {
-          result = await pi.exec(bunBin, [ompCli, ...args], { signal, cwd, timeout: timeoutMs });
+          result = await spawnWithStreaming(bunBin, [ompCli, ...args], spawnOpts, onUpdate as ((u: Record<string, unknown>) => void) | undefined);
         } catch (fallbackErr) {
           // Clean up temp file on failure
           if (promptPath) await unlink(promptPath).catch(() => {});

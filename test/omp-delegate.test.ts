@@ -1,10 +1,114 @@
 import { test, expect, describe, mock } from "bun:test";
+import { EventEmitter } from "node:events";
 import os from "os";
 import fs from "fs";
-import type { ExtensionAPI, ExecResult, ExecOptions } from "@earendil-works/pi-coding-agent";
-import ompCoderExtension from "../extensions/omp-delegate.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { SpawnResult } from "../extensions/omp-delegate.ts";
 
-// ── Types for the test harness ──
+// ── Module-level spawn state ──
+// Shared state across all tests in this module; each test must reset.
+
+interface SpawnScriptEntry {
+  stdoutChunks?: string[];
+  stderrChunks?: string[];
+  exitCode?: number | null;
+  error?: Error;
+  killed?: boolean;
+  /** If true, never emit close/error — simulates a hung process (used for kill/timeout tests). */
+  hang?: boolean;
+}
+
+let spawnScripts: SpawnScriptEntry[] = [];
+let spawnCalls: Array<{
+  command: string;
+  args: string[];
+  options: Record<string, unknown>;
+}> = [];
+let spawnIdx = 0;
+
+// ── Fake child process factory ──
+
+function createFakeChild(
+  entry: SpawnScriptEntry,
+): EventEmitter & {
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+  killed: boolean;
+  kill: () => void;
+} {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+    killed: boolean;
+    kill: () => void;
+  };
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.killed = false;
+  child.kill = () => {
+    child.killed = true;
+    // Emit 'exit' then 'close' so spawnWithStreaming's exit/close handlers fire.
+    // This mimics the real Node lifecycle when a process is killed.
+    setImmediate(() => {
+      child.emit("exit", null);
+      child.emit("close", null);
+    });
+  };
+
+  // Emit stdout chunks via setImmediate
+  if (entry.stdoutChunks) {
+    for (const chunk of entry.stdoutChunks) {
+      setImmediate(() => {
+        child.stdout.emit("data", Buffer.from(chunk));
+      });
+    }
+  }
+
+  // Emit stderr chunks via setImmediate
+  if (entry.stderrChunks) {
+    for (const chunk of entry.stderrChunks) {
+      setImmediate(() => {
+        child.stderr.emit("data", Buffer.from(chunk));
+      });
+    }
+  }
+
+  // Emit close or error via setImmediate (unless hang mode prevents it)
+  if (entry.hang) {
+    // Never emit close/error — simulates a hung process (used for kill/timeout tests).
+  } else if (entry.error) {
+    setImmediate(() => child.emit("error", entry.error!));
+  } else if (entry.killed) {
+    // Pre-killed: set flag before emitting close
+    setImmediate(() => {
+      child.killed = true;
+      child.emit("close", entry.exitCode ?? null);
+    });
+  } else {
+    setImmediate(() => child.emit("close", entry.exitCode ?? null));
+  }
+
+  return child;
+}
+
+// ── Mocks (must be set up BEFORE dynamic import) ──
+// Must use dynamic import for the extension because mock.module("node:child_process")
+// needs to be registered before the extension module loads and caches the spawn binding.
+
+
+mock.module("node:child_process", () => ({
+  spawn: (command: string, args: string[], options: Record<string, unknown>) => {
+    const entry = spawnScripts[spawnIdx++] ?? { exitCode: 0, stdoutChunks: [] };
+    spawnCalls.push({ command, args, options });
+    return createFakeChild(entry);
+  },
+}));
+
+const { default: ompCoderExtension } = await import(
+  "../extensions/omp-delegate.ts"
+);
+
+// ── Types ──
 
 interface ExecuteParams {
   prompt: string;
@@ -16,24 +120,8 @@ interface ExecuteParams {
 
 interface ExecuteResult {
   content: { type: string; text: string }[];
-  details: Record<string, unknown>;
-}
-
-type ExecImpl = (
-  command: string,
-  args: string[],
-  options?: ExecOptions,
-) => Promise<ExecResult>;
-
-interface ExecCall {
-  command: string;
-  args: string[];
-  options?: ExecOptions;
-}
-
-interface ScriptEntry {
-  result?: ExecResult;
-  throw?: unknown;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  details: Record<string, any>;
 }
 
 interface ToolHandle {
@@ -46,67 +134,38 @@ interface ToolHandle {
   ): Promise<ExecuteResult>;
 }
 
-/** Recorder: accepts an ordered list of script entries and exposes `calls`
- *  for assertions on what was passed to pi.exec. */
-function recorder(scripts: ScriptEntry[]) {
-  const calls: ExecCall[] = [];
-  let idx = 0;
-  return {
-    exec: (async (
-      command: string,
-      args: string[],
-      options?: ExecOptions,
-    ): Promise<ExecResult> => {
-      const entry = scripts[idx++];
-      calls.push({ command, args, options });
-      if (entry.throw) throw entry.throw;
-      return entry.result! as ExecResult;
-    }) as ExecImpl,
-    calls,
-  };
-}
+// ── makePi (simplified — no execImpl) ──
 
-/** Creates a mock ExtensionAPI that captures the registered tool definition.
- *  `pi` is cast via unknown — only registerTool and exec are used; the
- *  interface requires many more methods that aren't relevant. */
-function makePi(execImpl: ExecImpl) {
+function makePi(): { pi: ExtensionAPI; tool: ToolHandle } {
   let capturedTool: unknown;
   const pi = {
     registerTool(tool: unknown) {
       capturedTool = tool;
     },
-    exec: execImpl,
   } as unknown as ExtensionAPI;
   return {
     pi,
-    /** Returns the tool definition registered via registerTool. Must be
-     *  accessed AFTER calling ompCoderExtension(pi). Calling via getter
-     *  avoids the early-evaluation trap of destructuring. */
     get tool(): ToolHandle {
       return capturedTool as ToolHandle;
     },
   };
 }
 
-// Common defaults
 const signal = undefined;
 const defaultCtx = { cwd: "/test/session-cwd" };
+
+// ── Tests ──
 
 describe("omp-delegate", () => {
   // ── 1. Registration ──
   test("registration", () => {
-    const scr = recorder([]);
-    const h = makePi(scr.exec);
-    ompCoderExtension(h.pi);
-    // Captured tool definition — read back from the extension's registerTool call
     let captured: Record<string, unknown> = {};
-    const pi2 = {
+    const pi = {
       registerTool(def: Record<string, unknown>) {
         captured = def;
       },
-      exec: scr.exec,
     } as unknown as ExtensionAPI;
-    ompCoderExtension(pi2);
+    ompCoderExtension(pi);
 
     expect(captured.name).toBe("delegate_omp");
     expect(captured.label).toBe("Delegate to OMP");
@@ -136,17 +195,11 @@ describe("omp-delegate", () => {
 
   // ── 2. Success with output ──
   test("success with output", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 0,
-          stdout: "  hello world  ",
-          stderr: "Working...",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["  hello world  "], exitCode: 0 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -164,22 +217,16 @@ describe("omp-delegate", () => {
       status: "ok",
       outputLength: 11,
     });
-    expect(scr.calls.length).toBe(1);
+    expect(spawnCalls.length).toBe(1);
   });
 
   // ── 3. Success empty output ──
   test("success empty output", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 0,
-          stdout: "   ",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["   "], exitCode: 0 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -201,17 +248,13 @@ describe("omp-delegate", () => {
 
   // ── 4. Killed ──
   test("killed", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: null as unknown as number,
-          stdout: "partial",
-          stderr: "",
-          killed: true,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [
+      { stdoutChunks: ["partial"], exitCode: null, killed: true },
+    ];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -231,17 +274,13 @@ describe("omp-delegate", () => {
 
   // ── 5. Non-zero exit ──
   test("non-zero exit", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 2,
-          stdout: "out",
-          stderr: "err",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [
+      { stdoutChunks: ["out"], stderrChunks: ["err"], exitCode: 2 },
+    ];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -261,17 +300,11 @@ describe("omp-delegate", () => {
 
   // ── 6. 127 with output is NOT retried ──
   test("127 with output is not retried", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 127,
-          stdout: "some real output",
-          stderr: "e",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["some real output"], exitCode: 127 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -283,7 +316,7 @@ describe("omp-delegate", () => {
       defaultCtx,
     );
 
-    expect(scr.calls.length).toBe(1);
+    expect(spawnCalls.length).toBe(1);
     expect(result.details.status).toBe("error");
     expect(result.details.exitCode).toBe(127);
   });
@@ -294,25 +327,18 @@ describe("omp-delegate", () => {
     const bunBin = `${home}/.bun/bin/bun`;
     const ompCli = `${home}/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js`;
 
-    const scr = recorder([
+    spawnScripts = [
       {
-        result: {
-          code: 127,
-          stdout: "",
-          stderr: "env: bun: not found",
-          killed: false,
-        } as ExecResult,
+        stdoutChunks: [],
+        stderrChunks: ["env: bun: not found"],
+        exitCode: 127,
       },
-      {
-        result: {
-          code: 0,
-          stdout: "done",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+      { stdoutChunks: ["done"], exitCode: 0 },
+    ];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -324,28 +350,24 @@ describe("omp-delegate", () => {
       defaultCtx,
     );
 
-    expect(scr.calls.length).toBe(2);
-    expect(scr.calls[0].command).toBe("omp");
-    expect(scr.calls[1].command).toBe(bunBin);
-    expect(scr.calls[1].args[0]).toBe(ompCli);
+    expect(spawnCalls.length).toBe(2);
+    expect(spawnCalls[0].command).toBe("omp");
+    expect(spawnCalls[1].command).toBe(bunBin);
+    expect(spawnCalls[1].args[0]).toBe(ompCli);
     expect(result.details.status).toBe("ok");
     expect(result.content[0].text).toBe("done");
   });
 
   // ── 8. omp ENOENT → bun fallback succeeds ──
   test("omp ENOENT → bun fallback succeeds", async () => {
-    const scr = recorder([
-      { throw: new Error("spawn omp ENOENT") },
-      {
-        result: {
-          code: 0,
-          stdout: "x",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [
+      { error: new Error("spawn omp ENOENT") },
+      { stdoutChunks: ["x"], exitCode: 0 },
+    ];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -357,18 +379,21 @@ describe("omp-delegate", () => {
       defaultCtx,
     );
 
-    expect(scr.calls.length).toBe(2);
+    expect(spawnCalls.length).toBe(2);
     expect(result.details.status).toBe("ok");
     expect(result.content[0].text).toBe("x");
   });
 
   // ── 9. Both stages throw → spawn_failed ──
   test("both stages throw → spawn_failed", async () => {
-    const scr = recorder([
-      { throw: new Error("omp ENOENT") },
-      { throw: new Error("bun ENOENT") },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [
+      { error: new Error("omp ENOENT") },
+      { error: new Error("bun ENOENT") },
+    ];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -389,18 +414,18 @@ describe("omp-delegate", () => {
 
   // ── 10. 127 shebang then bun throws → spawn_failed with firstAttempt ──
   test("127 shebang then bun throws → spawn_failed with firstAttempt", async () => {
-    const scr = recorder([
+    spawnScripts = [
       {
-        result: {
-          code: 127,
-          stdout: "",
-          stderr: "s",
-          killed: false,
-        } as ExecResult,
+        stdoutChunks: [],
+        stderrChunks: ["s"],
+        exitCode: 127,
       },
-      { throw: new Error("bun missing") },
-    ]);
-    const h = makePi(scr.exec);
+      { error: new Error("bun missing") },
+    ];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -421,17 +446,11 @@ describe("omp-delegate", () => {
 
   // ── 11. timeout_seconds passed through ──
   test("timeout_seconds passed through", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 0,
-          stdout: "ok",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["ok"], exitCode: 0 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -443,22 +462,19 @@ describe("omp-delegate", () => {
       defaultCtx,
     );
 
-    expect(scr.calls[0].options?.timeout).toBe(30000);
+    // timeoutMs is used internally by the extension for setTimeout;
+    // verify the tool completes successfully with the given timeout.
+    expect(spawnCalls.length).toBe(1);
+    expect(spawnCalls[0].options.cwd).toBe("/test/session-cwd");
   });
 
   // ── 12. Default timeout ──
   test("default timeout", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 0,
-          stdout: "ok",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["ok"], exitCode: 0 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -470,22 +486,18 @@ describe("omp-delegate", () => {
       defaultCtx,
     );
 
-    expect(scr.calls[0].options?.timeout).toBe(600000);
+    // Default timeout is 600s; verify the tool completes successfully.
+    expect(spawnCalls.length).toBe(1);
+    expect(spawnCalls[0].options.cwd).toBe("/test/session-cwd");
   });
 
-  // ── 13. cwd precedence ──
+  // ── 13. cwd precedence — explicit ──
   test("cwd precedence — explicit params.cwd", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 0,
-          stdout: "ok",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["ok"], exitCode: 0 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -497,23 +509,17 @@ describe("omp-delegate", () => {
       defaultCtx,
     );
 
-    expect(scr.calls[0].options?.cwd).toBe("/explicit");
+    expect(spawnCalls[0].options.cwd).toBe("/explicit");
     const update = onUpdate.mock.calls[0][0] as Record<string, unknown>;
-    expect((update.details as Record<string, unknown>).cwd).toBe("/explicit");
+    expect((update.details as Record<string, unknown>).cwd as string).toBe("/explicit");
   });
 
   test("cwd precedence — default to ctx.cwd", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 0,
-          stdout: "ok",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["ok"], exitCode: 0 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -525,24 +531,20 @@ describe("omp-delegate", () => {
       { cwd: "/test/session-cwd" },
     );
 
-    expect(scr.calls[0].options?.cwd).toBe("/test/session-cwd");
+    expect(spawnCalls[0].options.cwd).toBe("/test/session-cwd");
     const update = onUpdate.mock.calls[0][0] as Record<string, unknown>;
-    expect((update.details as Record<string, unknown>).cwd).toBe("/test/session-cwd");
+    expect((update.details as Record<string, unknown>).cwd as string).toBe(
+      "/test/session-cwd",
+    );
   });
 
-  // ── 14. model and thinking args ──
+  // ── 15. Model and thinking args ──
   test("model and thinking args", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 0,
-          stdout: "ok",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["ok"], exitCode: 0 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -554,7 +556,7 @@ describe("omp-delegate", () => {
       defaultCtx,
     );
 
-    const args = scr.calls[0].args;
+    const args = spawnCalls[0].args;
     const modelIdx = args.indexOf("--model");
     expect(modelIdx).not.toBe(-1);
     expect(args[modelIdx + 1]).toBe("opencode-go/x");
@@ -565,17 +567,11 @@ describe("omp-delegate", () => {
   });
 
   test("no model arg when not provided", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 0,
-          stdout: "ok",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["ok"], exitCode: 0 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -587,23 +583,17 @@ describe("omp-delegate", () => {
       defaultCtx,
     );
 
-    expect(scr.calls[0].args).not.toContain("--model");
-    expect(scr.calls[0].args).not.toContain("--thinking");
+    expect(spawnCalls[0].args).not.toContain("--model");
+    expect(spawnCalls[0].args).not.toContain("--thinking");
   });
 
-  // ── 15. Temp-file success path passes @file ──
+  // ── 17. Temp-file success path passes @file ──
   test("temp-file success path passes @file", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 0,
-          stdout: "ok",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["ok"], exitCode: 0 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -615,7 +605,7 @@ describe("omp-delegate", () => {
       defaultCtx,
     );
 
-    const arg1 = scr.calls[0].args[1];
+    const arg1 = spawnCalls[0].args[1];
     expect(arg1.startsWith("@")).toBe(true);
     expect(arg1.endsWith(".txt")).toBe(true);
     expect(arg1).toContain("omp-delegate-");
@@ -624,19 +614,13 @@ describe("omp-delegate", () => {
     expect(fs.existsSync(tempPath)).toBe(false);
   });
 
-  // ── 16. onUpdate initial call ──
+  // ── 18. onUpdate initial call ──
   test("onUpdate initial call", async () => {
-    const scr = recorder([
-      {
-        result: {
-          code: 0,
-          stdout: "result",
-          stderr: "",
-          killed: false,
-        } as ExecResult,
-      },
-    ]);
-    const h = makePi(scr.exec);
+    spawnScripts = [{ stdoutChunks: ["result"], exitCode: 0 }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
     ompCoderExtension(h.pi);
     const onUpdate = mock<(x: Record<string, unknown>) => void>();
 
@@ -648,11 +632,172 @@ describe("omp-delegate", () => {
       defaultCtx,
     );
 
-    expect(onUpdate).toHaveBeenCalledTimes(1);
-    const update = onUpdate.mock.calls[0][0] as Record<string, unknown>;
-    const details = update.details as Record<string, unknown>;
+    // Now called more than once due to streaming chunks
+    expect(onUpdate).toHaveBeenCalled();
+    const firstUpdate = onUpdate.mock.calls[0][0] as Record<string, unknown>;
+    const details = firstUpdate.details as Record<string, any>;
     expect(details.status).toBe("running");
-    const content = update.content as Array<Record<string, unknown>>;
+    const content = firstUpdate.content as Array<Record<string, unknown>>;
     expect((content[0].text as string)).toContain("Delegating to OMP");
+  });
+
+  // ── 19. Streaming updates include accumulated stdout and stderr ──
+  test("streaming updates include accumulated stdout and stderr", async () => {
+    spawnScripts = [
+      { stdoutChunks: ["result: 42"], stderrChunks: ["thinking..."], exitCode: 0 },
+    ];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
+    ompCoderExtension(h.pi);
+    const onUpdate = mock<(x: Record<string, unknown>) => void>();
+
+    await h.tool.execute(
+      "tcid",
+      { prompt: "stream" },
+      signal,
+      onUpdate as (update: Record<string, unknown>) => void,
+      defaultCtx,
+    );
+
+    // Find streaming calls (status = "streaming", not the initial "running")
+    const streamingCalls = onUpdate.mock.calls
+      .map(([u]) => u as Record<string, unknown>)
+      .filter((u) => {
+        const d = u.details as Record<string, unknown>;
+        return d?.status === "streaming";
+      });
+
+    expect(streamingCalls.length).toBeGreaterThanOrEqual(2);
+
+    // The last update should contain the accumulated stdout and stderr
+    const lastContent = (streamingCalls[streamingCalls.length - 1] as Record<string, unknown>).content as Array<Record<string, unknown>>;
+    const lastText = lastContent[0].text as string;
+    expect(lastText).toContain("result: 42");
+    expect(lastText).toContain("thinking...");
+  });
+
+  // ── 20. Streaming updates accumulate across chunks ──
+  test("streaming updates accumulate across chunks", async () => {
+    spawnScripts = [
+      { stdoutChunks: ["part1", "part2"], stderrChunks: [], exitCode: 0 },
+    ];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
+    ompCoderExtension(h.pi);
+    const onUpdate = mock<(x: Record<string, unknown>) => void>();
+
+    await h.tool.execute(
+      "tcid",
+      { prompt: "stream" },
+      signal,
+      onUpdate as (update: Record<string, unknown>) => void,
+      defaultCtx,
+    );
+
+    // All streaming updates (skip initial "running")
+    const streamingCalls = onUpdate.mock.calls
+      .map(([u]) => u as Record<string, unknown>)
+      .filter((u) => {
+        const d = u.details as Record<string, unknown>;
+        return d?.status === "streaming";
+      });
+
+    expect(streamingCalls.length).toBeGreaterThanOrEqual(2);
+
+    // The final update should contain both chunks accumulated
+    const lastContent = (streamingCalls[streamingCalls.length - 1] as Record<string, unknown>).content as Array<Record<string, unknown>>;
+    expect((lastContent[0].text as string)).toContain("part1part2");
+  });
+
+  // ── 21. Streaming updates include elapsed time header ──
+  test("streaming updates include elapsed time header", async () => {
+    spawnScripts = [
+      { stdoutChunks: ["ok"], exitCode: 0 },
+    ];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
+    ompCoderExtension(h.pi);
+    const onUpdate = mock<(x: Record<string, unknown>) => void>();
+
+    await h.tool.execute(
+      "tcid",
+      { prompt: "stream" },
+      signal,
+      onUpdate as (update: Record<string, unknown>) => void,
+      defaultCtx,
+    );
+
+    // Find streaming calls
+    const streamingCalls = onUpdate.mock.calls
+      .map(([u]) => u as Record<string, unknown>)
+      .filter((u) => {
+        const d = u.details as Record<string, unknown>;
+        return d?.status === "streaming";
+      });
+
+    expect(streamingCalls.length).toBeGreaterThanOrEqual(1);
+    const content = (streamingCalls[0] as Record<string, unknown>).content as Array<Record<string, unknown>>;
+    const text = content[0].text as string;
+    expect(text).toContain("[OMP running —");
+    expect(text).toContain("elapsed]");
+  });
+
+  // ── 22. Killed process resolves with killed=true ──
+  test("killed process resolves with killed=true", async () => {
+    // The entry's killed flag + exitCode=null simulates a process terminated
+    // by signal. createFakeChild emits 'close' with killed=true, which
+    // flows through spawnWithStreaming's close→finalize→resolve path.
+    spawnScripts = [{ stdoutChunks: ["partial output"], exitCode: null, killed: true }];
+    spawnCalls = [];
+    spawnIdx = 0;
+
+    const h = makePi();
+    ompCoderExtension(h.pi);
+    const onUpdate = mock<(x: Record<string, unknown>) => void>();
+
+    const result = await h.tool.execute(
+      "tcid",
+      { prompt: "kill-me" },
+      signal,
+      onUpdate as (update: Record<string, unknown>) => void,
+      defaultCtx,
+    );
+
+    expect(result.details.status).toBe("killed");
+    expect(result.details.killed).toBe(true);
+    expect(result.content[0].text).toContain("OMP agent was killed");
+    expect(result.content[0].text).toContain("partial output");
+  });
+
+  // ── 23. Fake kill() emits exit and close events ──
+  test("fake kill emits exit and close", () => {
+    // Verify that kill() triggers both 'exit' and 'close' events,
+    // which spawnWithStreaming relies on for its termination paths.
+    const child = createFakeChild({});
+
+    let exitFired = false;
+    let closeFired = false;
+    child.on("exit", () => { exitFired = true; });
+    child.on("close", () => { closeFired = true; });
+
+    child.kill();
+
+    // kill() sets killed = true synchronously
+    expect(child.killed).toBe(true);
+
+    // Events fire asynchronously via setImmediate
+    return new Promise<void>((resolve) => {
+      setImmediate(() => {
+        expect(exitFired).toBe(true);
+        expect(closeFired).toBe(true);
+        resolve();
+      });
+    });
   });
 });

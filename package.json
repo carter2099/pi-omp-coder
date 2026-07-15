@@ -1,6 +1,6 @@
 {
   "name": "@carter2099/pi-omp-coder",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "Pi extension that lets the agent delegate heavy coding tasks to an OMP (Oh My Pi) subprocess with a richer tool set (LSP, AST, browser, etc.).",
   "type": "module",
   "license": "MIT",
