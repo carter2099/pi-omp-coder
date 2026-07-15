@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import os from "os";
+
 
 export default function ompCoderExtension(pi: ExtensionAPI) {
   pi.registerTool({
@@ -66,15 +68,20 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
         details: { status: "running", cwd },
       });
 
+      // Resolve omp path: pi.exec inherits a minimal PATH (no ~/.bun/bin),
+      // so we use the absolute path to the bun-managed install.
+      const home = os.homedir();
+      const ompPath = `${home}/.bun/bin/omp`;
+
       let result;
       try {
-        result = await pi.exec("omp", args, { signal, cwd, timeout: timeoutMs });
+        result = await pi.exec(ompPath, args, { signal, cwd, timeout: timeoutMs });
       } catch (err) {
         return {
           content: [
             {
               type: "text",
-              text: `ERROR: Failed to spawn 'omp'. Is the OMP CLI installed and on PATH?\n\n${err}`,
+              text: `ERROR: Failed to spawn OMP at ${ompPath}. Is bun installed?\n\n${err}`,
             },
           ],
           details: { error: String(err), status: "spawn_failed" },
