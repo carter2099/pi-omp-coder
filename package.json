@@ -1,0 +1,51 @@
+{
+  "name": "@carter2099/pi-omp-coder",
+  "version": "0.1.0",
+  "description": "Pi extension that lets the agent delegate heavy coding tasks to an OMP (Oh My Pi) subprocess with a richer tool set (LSP, AST, browser, etc.).",
+  "type": "module",
+  "license": "MIT",
+  "author": "carter2099 <carter2099@pm.me>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/carter2099/pi-omp-coder.git"
+  },
+  "bugs": {
+    "url": "https://github.com/carter2099/pi-omp-coder/issues"
+  },
+  "homepage": "https://github.com/carter2099/pi-omp-coder#readme",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "omp",
+    "oh-my-pi",
+    "delegate",
+    "subagent"
+  ],
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/omp-delegate.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "latest",
+    "@types/node": "^26.1.1",
+    "typebox": "latest",
+    "typescript": "^5.9.3"
+  }
+}
