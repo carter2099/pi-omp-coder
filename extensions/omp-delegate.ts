@@ -1,6 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import os from "os";
+import { writeFile, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
+
 
 
 export default function ompCoderExtension(pi: ExtensionAPI) {
@@ -34,9 +38,17 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
         }),
       ),
       thinking: Type.Optional(
-        Type.String({
+        Type.Union([
+          Type.Literal("off"),
+          Type.Literal("minimal"),
+          Type.Literal("low"),
+          Type.Literal("medium"),
+          Type.Literal("high"),
+          Type.Literal("xhigh"),
+          Type.Literal("max"),
+        ], {
           description:
-            "Thinking level: off, minimal, low, medium, high, xhigh, max, auto. Defaults to OMP's default.",
+            "Thinking level: off, minimal, low, medium, high, xhigh, max. Defaults to OMP's default.",
         }),
       ),
       timeout_seconds: Type.Optional(
@@ -53,8 +65,23 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
       const cwd = params.cwd ?? ctx.cwd;
       const timeoutMs = (params.timeout_seconds ?? 600) * 1000;
 
-      // Build omp args
-      const args = ["-p", params.prompt, "--cwd", cwd, "--allow-home"];
+      // Write prompt to a temp file to avoid argv-parsing issues in omp:
+      // prompts starting with "-" or "@" are interpreted as flags or file
+      // includes rather than the message. The @file syntax is safe.
+      const promptFile = `${tmpdir()}/omp-delegate-${randomUUID()}.txt`;
+      let promptPath: string | undefined;
+      try {
+        await writeFile(promptFile, params.prompt, "utf-8");
+        promptPath = promptFile;
+      } catch {
+        // If we can't write the temp file, fall back to inline prompt.
+        // The leading-space trick prevents omp from seeing a leading "-".
+        promptPath = undefined;
+      }
+
+      // Build omp args. cwd is handled by pi.exec's spawn option, not --cwd.
+      // --allow-home is not a recognized omp flag; skip it.
+      const args = ["-p", promptPath ? `@${promptPath}` : ` ${params.prompt}`];
       if (params.model) {
         args.push("--model", params.model);
       }
@@ -84,6 +111,8 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
         try {
           result = await pi.exec(bunBin, [ompCli, ...args], { signal, cwd, timeout: timeoutMs });
         } catch (err) {
+          // Clean up temp file on failure
+          if (promptPath) await unlink(promptPath).catch(() => {});
           return {
             content: [{
               type: "text",
@@ -92,6 +121,9 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
             details: { error: String(err), status: "spawn_failed" },
           };
         }
+      } finally {
+        // Clean up temp file regardless of outcome
+        if (promptPath) await unlink(promptPath).catch(() => {});
       }
 
       // Handle timeout/kill
