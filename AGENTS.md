@@ -72,8 +72,16 @@ All paths return `{ content: [{ type: "text", text }], details: {...} }`. On suc
 
 ## Publishing
 
+1. Bump `version` in `package.json`.
+2. Tag with the `v` prefix: `git tag -a v<version> -m "<version>: <short description>"`.
+3. Push the tag: `git push origin v<version>`.
+
+The `.github/workflows/release.yml` workflow auto-creates a GitHub Release with generated notes when a `v`-prefixed semver tag is pushed.
+
+4. Publish to npm:
+
 ```bash
 npm publish --access public
 ```
 
-`files` in `package.json` includes only `extensions/`, `README.md`, `LICENSE` — so only those ship. Bump `version` in `package.json` before publish; the git tag convention is a bare version string (e.g. `0.1.6`).
+`files` in `package.json` includes only `extensions/`, `README.md`, `LICENSE` — so only those ship.
