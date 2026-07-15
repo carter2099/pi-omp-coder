@@ -68,29 +68,28 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
         details: { status: "running", cwd },
       });
 
-      // Resolve omp binary: try PATH first (works in interactive shells),
-      // fall back to bun's install path (needed for systemd contexts where
-      // ~/.bun/bin isn't on PATH).
+      // Resolve bun runtime and omp entrypoint via absolute paths.
+      // pi.exec inherits a minimal PATH in systemd contexts, and the omp
+      // symlink's shebang (#!/usr/bin/env bun) needs bun on PATH which
+      // isn't there. Bypass the shebang entirely: call bun directly.
       const home = os.homedir();
-      const bunOmpPath = `${home}/.bun/bin/omp`;
+      const bunBin = `${home}/.bun/bin/bun`;
+      const ompCli = `${home}/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js`;
+
+      // Prepend cli.js as the first positional arg to bun
+      args.unshift(ompCli);
 
       let result;
       try {
-        // Primary: PATH lookup (fast path for interactive sessions)
-        result = await pi.exec("omp", args, { signal, cwd, timeout: timeoutMs });
-      } catch {
-        // Fallback: absolute path to bun-managed install
-        try {
-          result = await pi.exec(bunOmpPath, args, { signal, cwd, timeout: timeoutMs });
-        } catch (err) {
-          return {
-            content: [{
-              type: "text",
-              text: `ERROR: Failed to spawn OMP. Tried 'omp' (PATH) and '${bunOmpPath}'. Is the OMP CLI installed?\n\n${err}`,
-            }],
-            details: { error: String(err), status: "spawn_failed" },
-          };
-        }
+        result = await pi.exec(bunBin, args, { signal, cwd, timeout: timeoutMs });
+      } catch (err) {
+        return {
+          content: [{
+            type: "text",
+            text: `ERROR: Failed to spawn OMP via ${bunBin}. Is bun installed?\n\n${err}`,
+          }],
+          details: { error: String(err), status: "spawn_failed" },
+        };
       }
 
       // Handle timeout/kill
