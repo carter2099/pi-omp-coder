@@ -34,7 +34,7 @@ Delegates a complex coding task to an OMP agent subprocess. The OMP agent runs a
 | `prompt` | string | yes | — | The task for the OMP agent. Be specific about files, changes, and acceptance criteria. The OMP agent has no context from this session. |
 | `cwd` | string | no | session cwd | Working directory for the OMP agent. |
 | `model` | string | no | OMP default | Model for the OMP agent (e.g. `opencode-go/deepseek-v4-pro`). |
-| `thinking` | string | no | OMP default | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. |
+| `thinking` | string | no | OMP default | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`. |
 | `timeout_seconds` | number | no | 600 | Hard timeout in seconds (10-3600). OMP is killed if it exceeds this. |
 
 ### Example

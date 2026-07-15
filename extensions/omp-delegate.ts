@@ -38,17 +38,9 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
         }),
       ),
       thinking: Type.Optional(
-        Type.Union([
-          Type.Literal("off"),
-          Type.Literal("minimal"),
-          Type.Literal("low"),
-          Type.Literal("medium"),
-          Type.Literal("high"),
-          Type.Literal("xhigh"),
-          Type.Literal("max"),
-        ], {
+        Type.String({
           description:
-            "Thinking level: off, minimal, low, medium, high, xhigh, max. Defaults to OMP's default.",
+            "Thinking level: off, minimal, low, medium, high, xhigh, max, auto. Defaults to OMP's default.",
         }),
       ),
       timeout_seconds: Type.Optional(
@@ -79,9 +71,9 @@ export default function ompCoderExtension(pi: ExtensionAPI) {
         promptPath = undefined;
       }
 
-      // Build omp args. cwd is handled by pi.exec's spawn option, not --cwd.
-      // --allow-home is not a recognized omp flag; skip it.
-      const args = ["-p", promptPath ? `@${promptPath}` : ` ${params.prompt}`];
+      // Build omp args. --allow-home prevents omp from auto-switching to
+      // /tmp when started from ~. --cwd sets the working directory.
+      const args = ["-p", promptPath ? `@${promptPath}` : ` ${params.prompt}`, "--cwd", cwd, "--allow-home"];
       if (params.model) {
         args.push("--model", params.model);
       }
