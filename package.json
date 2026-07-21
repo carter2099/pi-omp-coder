@@ -36,7 +36,8 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/omp-delegate.ts"
+      "./extensions/omp-delegate.ts",
+      "./extensions/ocusage.ts"
     ]
   },
   "peerDependencies": {
