@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 export default function ocusageExtension(pi: ExtensionAPI) {
   pi.registerTool({
@@ -11,7 +12,7 @@ export default function ocusageExtension(pi: ExtensionAPI) {
       "Use ocusage when the user asks about their OpenCode spend, billing, or usage limits.",
       "Prefer ocusage over the built-in /usage for billing questions — /usage only tracks omp's own API costs.",
     ],
-    parameters: {} as any,
+    parameters: Type.Object({}),
 
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
       try {
