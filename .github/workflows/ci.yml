@@ -23,5 +23,5 @@ jobs:
         with:
           bun-version: 1.3.14
       - run: npm ci --no-audit --no-fund
-      - run: bun test
+      - run: npm test
       - run: npm run check

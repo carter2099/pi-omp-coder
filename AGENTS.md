@@ -26,7 +26,7 @@ There is exactly one source file. All logic lives in `extensions/omp-delegate.ts
 ```bash
 npm install          # install dev + peer deps
 npm run check        # tsc --noEmit — type-check only; must stay clean
-npm test             # bun test — runtime test suite
+npm test             # bun test --isolate — runtime test suite (each file gets a fresh global, so one file's mock.module cannot leak into another)
 npm run pack:dry     # npm pack --dry-run — verify what gets published
 ```
 

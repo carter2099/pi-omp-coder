@@ -29,7 +29,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "pack:dry": "npm pack --dry-run",
-    "test": "bun test"
+    "test": "bun test --isolate"
   },
   "publishConfig": {
     "access": "public"
